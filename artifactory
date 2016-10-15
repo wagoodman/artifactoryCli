@@ -1,0 +1,456 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import collections
+import argparse
+import requests
+import hashlib
+import codecs
+import urllib
+import json
+import sys
+import re
+import os
+
+ARTIFACTORY_URL = "repo.jfrog.org/artifactory"
+TIMEOUT = 30.0
+CACHE_FILENAME = ".artifactory.cache"
+SESSION = requests.Session()
+
+if sys.stdout.isatty():
+    output_encoding = sys.stdout.encoding
+    errors = 'replace'
+else:
+    output_encoding = 'utf-8'  # allow override from settings
+    errors = None  # perhaps parse from settings, not needed for UTF8
+sys.stdout = codecs.getwriter(output_encoding)(sys.stdout, errors=errors)
+
+
+class bcolors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    NORMAL = '\033[0m'
+    BOLD = '\033[1m'
+
+def getTerminalSize():
+    env = os.environ
+    def ioctl_GWINSZ(fd):
+        try:
+            import fcntl, termios, struct, os
+            cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ,
+        '1234'))
+        except:
+            return
+        return cr
+    cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+    if not cr:
+        try:
+            fd = os.open(os.ctermid(), os.O_RDONLY)
+            cr = ioctl_GWINSZ(fd)
+            os.close(fd)
+        except:
+            pass
+    if not cr:
+        cr = (env.get('LINES', 25), env.get('COLUMNS', 80))
+
+        ### Use get(key[, default]) instead of a try/catch
+        try:
+            cr = (env['LINES'], env['COLUMNS'])
+        except:
+            cr = (25, 80)
+    return cr
+
+def formatLine(line):
+    lines, columns = getTerminalSize()
+    return str("%-"+str(columns)+"s")%line
+
+def sizeof_fmt(num, suffix='B'):
+    for unit in ['','Ki','Mi','Gi','Ti','Pi','Ei','Zi']:
+        if abs(num) < 1024.0:
+            return "%3.1f %s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.1f %s%s" % (num, 'Yi', suffix)
+
+def _url(path):
+    ret = 'http://'+ARTIFACTORY_URL + path
+    return ret
+
+def get_package(repository, group):
+    repository = urllib.quote(repository, safe='')
+    group = urllib.quote(group, safe='')
+    return SESSION.get(_url('/api/storage/%s/%s' % (repository, group)), timeout=TIMEOUT)
+
+def get_artifacts(repository, group, package):
+    repository = urllib.quote(repository, safe='')
+    group = urllib.quote(group, safe='')
+    package = urllib.quote(package, safe='')
+    return SESSION.get(_url('/api/storage/%s/%s/%s' % (repository, group, package)), timeout=TIMEOUT)
+
+def search_artifacts(repository, package):
+    package = urllib.quote(package, safe='')
+    if repository:
+        repository = urllib.quote(repository, safe='')
+        return SESSION.get(_url('/api/search/artifact?name=%s&repos=%s' % (package, repository)), timeout=TIMEOUT)
+    return SESSION.get(_url('/api/search/artifact?name=%s' % package), timeout=TIMEOUT)
+
+def get_artifact_uri(repository, group, package, artifact_uri):
+    repository = urllib.quote(repository, safe='')
+    group = urllib.quote(group, safe='')
+    package = urllib.quote(package, safe='')
+    artifact_uri = urllib.quote(artifact_uri, safe='')
+    return _url('/%s/%s/%s/%s' % (repository, group, package, artifact_uri))
+
+def get_artifacts_data(repository, group, module):
+    response = get_artifacts(repository, group, module)
+    data = json.loads(response.content)
+
+    if 'errors' in data:
+        print "Error: could not find info on '%s/%s/%s'" % (repository, group, module)
+        print response.content
+        sys.exit(1)
+
+    artifacts = list()
+
+    for item in data['children']:
+        package = item['uri'][1:]
+        artifacts.append( package )
+
+    return artifacts
+
+def sha1OfFile(filepath):
+    sha = hashlib.sha1()
+    with open(filepath, 'rb') as f:
+        while True:
+            block = f.read(2**10) # Magic number: one-megabyte blocks.
+            if not block: break
+            sha.update(block)
+        return sha.hexdigest()
+
+################################################################################
+
+def _search_for_package(name, repository=None, getinfo=True):
+    results = {}
+    if repository:
+        repositories = [repository]
+    else:
+        repositories = [None]
+
+    for repository in repositories:
+
+        response = search_artifacts(repository, name)
+
+        if response.status_code != 200:
+            print "Unable to find artifact %s." % repr(name)
+            sys.exit(1)
+
+        data = json.loads(response.content)
+
+        if getinfo:
+            for result in data["results"]:
+
+                response = SESSION.get(result["uri"])
+                if response.status_code != 200:
+                    print "Unable to find artifact info %s." % repr(name)
+                    sys.exit(1)
+
+                packageInfo = json.loads(response.content)
+
+                uri = packageInfo["downloadUri"]
+                checksum = packageInfo["checksums"]["sha1"]
+                packagePath = packageInfo["path"]
+                results[packagePath] = (repository, uri, checksum)
+        else:
+            for result in data["results"]:
+                uri = result["uri"]
+                results[uri] = (None, uri, None)
+
+    return results
+
+def search_packages(name, repository=None, getinfo=True):
+    results = _search_for_package(name, repository, getinfo=getinfo)
+
+    print bcolors.HEADER + "Search results:" + bcolors.NORMAL
+    for packagePath, (foundInRepository, uri, checksum) in results.items():
+        if getinfo:
+            print "   %s: %-s %-s" % (foundInRepository, checksum, packagePath)
+        else:
+            print "   %s" % uri
+
+def verify_packages_from_cache(destination):
+    success = True
+    cachePath = destination+"/"+CACHE_FILENAME
+    if os.path.exists(cachePath):
+        with open(cachePath, 'r') as cachefile:
+            artifacts, flatten = json.load(cachefile)
+    else:
+        print "%sError: could not find cache.%s" % (bcolors.RED, bcolors.NORMAL)
+        sys.exit(1)
+
+    print "%sVerifying artifacts...%s" % (bcolors.BOLD, bcolors.NORMAL)
+    for filename, uri, checksum in artifacts:
+        displayName = filename.split("/")[-1]
+
+        if flatten:
+            packagePath = destination+"/"+displayName
+        else:
+            packagePath = destination+"/"+filename
+
+        if os.path.exists(packagePath):
+            sha1 = sha1OfFile(packagePath)
+            if sha1 == checksum:
+                print u"   %s✔%s %-60s %s"% (bcolors.GREEN, bcolors.NORMAL, displayName, checksum)
+
+            else:
+                print u"   %s✘%s %s \n%s        expected sha1: %s\n        got sha1:      %s\n        uri: %s %s"% \
+                       (bcolors.RED, bcolors.NORMAL, displayName, bcolors.BLUE, checksum, sha1, uri, bcolors.NORMAL)
+                success = False
+
+        else:
+            print u"   %s✘%s %s \n%s        Artifact missing!%s"% \
+                   (bcolors.RED, bcolors.NORMAL, displayName, bcolors.BLUE, bcolors.NORMAL)
+            success = False
+
+    return success
+
+def fetch_artifact_info(config, destination, flatten=False, repository=None):
+    artifacts = None
+    artifactoryAvailable = False
+    cachePath = destination+"/"+CACHE_FILENAME
+
+    try:
+
+        def infoProgress(package, idx, total):
+            msg = "%sFetching repository info%s: [%d/%d] %s " % (bcolors.BOLD, bcolors.NORMAL, idx, total, package)
+            #msg = u"   "% (bcolors.YELLOW, bcolors.NORMAL, "Fetching info on %s" % repr(package), percent)
+            msg = formatLine(msg)
+            sys.stdout.write('%s\r' % msg)
+            sys.stdout.flush()
+
+        # Always attempt to search for the newest packages
+        for idx, (key, artifactHint) in enumerate(config.items()):
+            infoProgress(artifactHint, idx+1, len(config.items()))
+
+            results = _search_for_package(artifactHint, repository)
+            artifactoryAvailable = True
+            if artifacts == None:
+                artifacts = list()
+
+            if len(results) == 1:
+                artifact = results.keys()[0]
+                foundInRepository, uri, checksum = results[artifact]
+                artifacts.append( (artifact, uri, checksum) )
+            else:
+                # there may be cases where there is an exact match, but the hint
+                # is not specific enough. e.g.:
+                #   Search for u'gcc-4.8.2-16.2.el7_0' results are inconclusive! (Results:2)
+                #       .../gcc-4.8.2-16.2.el7_0.x86_64.rpm
+                #       .../libgcc-4.8.2-16.2.el7_0.x86_64.rpm
+                # In this case, an artifact hint of "gcc-4.8.2-16.2.el7_0"
+                # should result in a positive match (preferred over an
+                # inconclusive search).
+                exactArtifactHintMatches = []
+                for nearArtifact, nearUri in results.items():
+                    if nearArtifact.split("/")[-1].startswith(artifactHint):
+                        exactArtifactHintMatches.append( (nearArtifact, nearUri) )
+
+                if len(exactArtifactHintMatches) == 1:
+                    for (artifact, (foundInRepository, uri, checksum)) in exactArtifactHintMatches:
+                        artifacts.append( (artifact, uri, checksum) )
+                else:
+                    print formatLine("Search for %s results are inconclusive! (Results:%d)" % (repr(artifactHint),len(results)))
+                    for badArtifact, badUri in results.items():
+                        print "   %s" % badArtifact
+                    sys.exit(1)
+
+        infoProgress("Complete!", len(config.items()), len(config.items()))
+        print
+
+        # Save cache for future offline use
+        with open(cachePath, 'w') as cachefile:
+            json.dump( (artifacts, flatten) , cachefile)
+
+    except requests.exceptions.ConnectionError:
+        print
+        # Attempt to find and use a cache
+        if os.path.exists(cachePath):
+            with open(cachePath, 'r') as cachefile:
+                artifacts, cacheFlattened = json.load(cachefile)
+                print "%sWarning: could not contact repository. Defaulting to sha1 cache verification.%s" % (bcolors.BLUE, bcolors.NORMAL)
+
+                if cacheFlattened != flatten:
+                    print "%sError: sha1 cache not usable (different layout).%s" % (bcolors.RED, bcolors.NORMAL)
+                    artifacts = None
+
+    return artifactoryAvailable, artifacts
+
+def download_packages(config, destination, flatten=False, repository=None):
+    success = True
+
+    artifactoryAvailable, artifacts = fetch_artifact_info(config, destination, flatten, repository)
+
+    if artifacts == None:
+        print "Could not fetch artifacts from repository or cache!"
+        sys.exit(1)
+
+    # Start downloading
+    print formatLine("%sDownloading to %s%s" %  (bcolors.BOLD, repr(destination),bcolors.NORMAL))
+    for idx, (filename, uri, checksum) in enumerate(artifacts):
+        printDisplayName = displayName = filename.split("/")[-1]
+        if len(displayName) > 60:
+            printDisplayName = displayName[:56]+"..."
+
+        if flatten:
+            packagePath = destination+"/"+displayName
+        else:
+            packagePath = destination+"/"+filename
+
+        parentDir = os.path.abspath(os.path.join(packagePath, os.pardir))
+
+        if not os.path.exists(parentDir):
+            os.makedirs( parentDir, 0755 )
+
+        msg = u"   %s⋯%s %-60s [%s]"% (bcolors.YELLOW, bcolors.NORMAL, printDisplayName, "connecting")
+        sys.stdout.write('%s\r' % msg)
+        sys.stdout.flush()
+
+        # don't download again if you have already downloaded it
+        if os.path.exists(packagePath):
+            sha1 = sha1OfFile(packagePath)
+            if sha1 == checksum:
+                print u"   %s✔%s %-60s %s %s"% (bcolors.GREEN, bcolors.NORMAL, printDisplayName, "[cached]        ", "[%d/%d]" % (idx+1, len(artifacts)))
+                continue
+            elif artifactoryAvailable == False:
+                print u"   %s✘%s %-60s %s %s\n%s        expected sha1: %s\n        got sha1:      %s\n        uri: %s %s"% \
+                       (bcolors.RED, bcolors.NORMAL, printDisplayName, "[cached]        ", "[%d/%d]" % (idx+1, len(artifacts)), bcolors.BLUE, trueSha1, sha1, uri, bcolors.NORMAL)
+                success = False
+                continue
+
+
+        def dlProgress(count, blockSize, totalSize):
+            # todo: throttle the screen update rate (currently it may be slowing the download speed)
+            percent = min(int(count*blockSize*100/totalSize),100)
+            #sys.stdout.write("\r" + "...%d%%" % percent)
+            msg = u"   %s⋯%s %-60s [%3d%%] %-9s %s"% (bcolors.YELLOW, bcolors.NORMAL, printDisplayName, percent, sizeof_fmt(totalSize), "[%d/%d]" % (idx+1, len(artifacts)))
+            sys.stdout.write('%s\r' % msg)
+            sys.stdout.flush()
+
+
+        # download the artifact
+        urllib.urlretrieve(uri, packagePath, reporthook=dlProgress)
+        sha1 = sha1OfFile(packagePath)
+
+        # validate the artifact
+        if sha1 == checksum:
+            print u"   %s✔%s %-60s"% (bcolors.GREEN, bcolors.NORMAL, printDisplayName)
+        else:
+            print u"   %s✘%s %-60s \n%s        expected sha1: %s\n        got sha1:      %s\n        uri: %s %s"% \
+                   (bcolors.RED, bcolors.NORMAL, printDisplayName, bcolors.BLUE, checksum, sha1, uri, bcolors.NORMAL)
+            success = False
+
+    return success
+
+################################################################################
+
+class Artifactory(object):
+
+    def __init__(self):
+        parser = argparse.ArgumentParser(
+            description='Fetch artifacts from artifactory',
+            usage='''artifactory <command> [<args>]
+
+Commands:
+
+   download     Download and verify one or more modules.
+   verify       Verify content of all packages from a local sha1 cache.
+   search       Show packages from repositories which match a given name.
+
+''')
+        parser.add_argument('command', help='Subcommand to run')
+
+        # only parse the first command arg
+        args = parser.parse_args(sys.argv[1:2])
+        if not hasattr(self, args.command) and "_" not in args.command:
+            print 'Unrecognized command'
+            parser.print_help()
+            exit(1)
+
+        # use dispatch pattern to invoke method with same name
+        getattr(self, args.command)()
+
+
+    def _getPaths(self, args):
+
+        if args.config == None:
+            print 'Specify a --config to read'
+            exit(1)
+
+        if not os.path.exists(args.config):
+            print 'Could not find specified config file "%s".' % args.config
+            exit(1)
+
+        with open(args.config, 'r') as configfile:
+            configDict = json.load(configfile)
+
+        # If there is already a list of software versions, then use it.
+        for key in tuple(configDict.keys()):
+            if isinstance(configDict[key], list) or isinstance(configDict[key], tuple):
+                items = configDict[key]
+                del configDict[key]
+                for item in items:
+                    configDict[item] = item
+
+        return configDict
+
+    def search(self):
+        parser = argparse.ArgumentParser(description='Show available versions for one or more modules.')
+
+        parser.add_argument('name', help='A package name (or partial name) to search for.')
+        parser.add_argument('-r', '--repo', action='store', default=None, help='Only search the given repository.')
+        parser.add_argument('-i', '--info', action='store_true', help='Get package details.')
+
+        # only parse the arguments for the subcommand
+        args = parser.parse_args(sys.argv[2:])
+
+        search_packages(args.name, args.repo, args.info)
+
+
+    def verify(self):
+        parser = argparse.ArgumentParser(description='Verify content of all packages from a local sha1 cache.')
+
+        parser.add_argument('-d', '--destination', action='store', required=True, help='Directory with the sha1 cache and downloaded files.')
+
+        # only parse the arguments for the subcommand
+        args = parser.parse_args(sys.argv[2:])
+
+        success = verify_packages_from_cache(args.destination)
+
+        if not success:
+            print "%sVerification failed!%s" % (bcolors.BOLD+bcolors.RED, bcolors.NORMAL)
+            sys.exit(1)
+        else:
+            print "%sVerification complete!%s" % (bcolors.BOLD, bcolors.NORMAL)
+
+    def download(self):
+        parser = argparse.ArgumentParser(description='Download and verify one or more modules.')
+
+        parser.add_argument('-d', '--destination', action='store', required=True, help='Directory to store the downloaded files.')
+        parser.add_argument('-c', '--config', action='store', help='Modules are specified in a configuration.')
+        parser.add_argument('-r', '--repo', action='store', default=None, help='Only download from the given repository.')
+        parser.add_argument('-f', '--flatten', action='store_true', help='Flatten directory tree (no sub directories will be created).')
+
+        # only parse the arguments for the subcommand
+        args = parser.parse_args(sys.argv[2:])
+
+        configDict = self._getPaths(args)
+
+        success = download_packages(configDict, args.destination, args.flatten, args.repo)
+
+        if not success:
+            print "%sDownload failed!%s" % (bcolors.BOLD+bcolors.RED, bcolors.NORMAL)
+            sys.exit(1)
+        else:
+            print "%sDownload complete!%s" % (bcolors.BOLD, bcolors.NORMAL)
+
+Artifactory()
