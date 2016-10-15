@@ -57,7 +57,7 @@ Or download artifacts to a single destination:
 ```
 $ ./artifactory download -c ./versions.json -d ./test --flatten
 ...
-[wagoodman@kiwi artifactoryCli]$ tree ./test
+$ tree ./test
 ./test
 ├── apache-tomcat-7.0.14.tar.gz
 ├── camel-quartz-1.6.0.jar.asc
